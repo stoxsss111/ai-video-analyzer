@@ -1,24 +1,26 @@
 import os
 import time
 import tempfile
-
 import streamlit as st
 
-from agno.agent import Agent
-from agno.models.google import Gemini
-from agno.tools.duckduckgo import DuckDuckGoTools
-
-import google.generativeai as genai
-from google.generativeai import upload_file, get_file
+from google import genai
+from google.genai import types
 
 from langchain_community.tools import DuckDuckGoSearchRun
-
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
+
+# Initialize Google GenAI client for Vertex AI
+project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "fleet-impact-493909-j6")
+location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+client = genai.Client(
+    vertexai=True,
+    project=project_id,
+    location=location
+)
 
 st.set_page_config(
     page_title="Multimodal AI Agent - Chat & Video Analysis",
@@ -26,7 +28,7 @@ st.set_page_config(
     layout="wide",
 )
 
-# Custom CSS for better UI
+# Custom CSS for premium UI
 st.markdown("""
     <style>
         .stChatFloatingInputContainer {
@@ -61,30 +63,20 @@ st.markdown("""
 
 # Application Title and Header
 st.title("AI Video Analyzer & Chat Agent 🤖🎥")
-st.header("Powered by Gemini 1.5 Flash & DuckDuckGo")
+st.header("Powered by Gemini 2.5 Flash on Vertex AI & DuckDuckGo")
 
 def initialize_session_state():
     """Initialize all session state variables"""
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-    if "processed_video_file" not in st.session_state:
-        st.session_state.processed_video_file = None
+    if "processed_video_path" not in st.session_state:
+        st.session_state.processed_video_path = None
     if "uploaded_video_name" not in st.session_state:
         st.session_state.uploaded_video_name = None
     if "last_activity" not in st.session_state:
         st.session_state.last_activity = time.time()
 
 initialize_session_state()
-
-@st.cache_resource
-def initialize_agent():
-    """Initialize the AI agent with Gemini model and DuckDuckGo tool"""
-    return Agent(
-        name="Video Analyzer & AI Chat Agent with Web Search",
-        model=Gemini(id="gemini-1.5-flash"),
-        tools=[DuckDuckGoTools()],
-        markdown=True,
-    )
 
 def auto_scroll():
     """Auto-scroll to the bottom of the chat"""
@@ -104,79 +96,93 @@ def check_session_timeout():
     st.session_state.last_activity = time.time()
 
 def process_video(file):
-    """Process uploaded video file using Gemini API"""
+    """Process uploaded video file and save it locally for analysis"""
     try:
         # Check if we've already processed this video
         if (st.session_state.uploaded_video_name == file.name and 
-            st.session_state.processed_video_file is not None):
+            st.session_state.processed_video_path is not None):
             return True
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
-            temp_video.write(file.read())
-            video_path = temp_video.name
+        # Save the uploaded file to a persistent folder in the workspace
+        temp_dir = os.path.join(os.getcwd(), "temp_videos")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        video_path = os.path.join(temp_dir, f"video_{int(time.time())}.mp4")
+        with open(video_path, "wb") as f:
+            f.write(file.read())
 
-        with st.spinner("Processing video..."):
-            processed_video = upload_file(video_path)
-            while processed_video.state.name == "PROCESSING":
-                time.sleep(1)
-                processed_video = get_file(processed_video.name)
-
-        if processed_video.state.name == "ACTIVE":
-            st.session_state.processed_video_file = processed_video
-            st.session_state.uploaded_video_name = file.name
-            st.success("Video processing complete! 🎉")
-            return True
-        else:
-            st.error("Video processing failed. Please try again.")
-            return False
+        st.session_state.processed_video_path = video_path
+        st.session_state.uploaded_video_name = file.name
+        st.success("Video processed successfully for analysis! 🎉")
+        return True
     except Exception as e:
         st.error(f"Video processing error: {e}")
         return False
-    finally:
-        # Clean up the temporary file
-        if 'temp_video' in locals():
-            os.unlink(temp_video.name)
 
 def generate_response(query):
-    """Generate AI response using video content and external knowledge"""
+    """Generate AI response using video content and external knowledge via Vertex AI"""
     try:
-        prompt = f"Use the uploaded video content and external knowledge to answer the question: {query}"
-        response = multimodal_Agent.run(
-                                         prompt,
-                                         videos=[{"filepath": st.session_state.processed_video_file.name}]
-                                        )
+        if not st.session_state.processed_video_path:
+            return "Please upload a video first."
 
-        ai_response = response.content
+        with open(st.session_state.processed_video_path, "rb") as f:
+            video_bytes = f.read()
 
-        if not ai_response or len(ai_response.strip()) < 50:
+        # Create inline video part for Vertex AI Gemini 2.5 Flash
+        video_part = types.Part.from_bytes(
+            data=video_bytes,
+            mime_type="video/mp4"
+        )
+
+        # Build list of contents starting with the video part
+        contents = [video_part]
+
+        # Add chat history to retain context
+        for msg in st.session_state.chat_history:
+            if msg["user"].startswith("🔍 Web search for:"):
+                continue
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=msg["user"])]))
+            contents.append(types.Content(role="model", parts=[types.Part.from_text(text=msg["ai"])]))
+
+        # Add the current prompt
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=query)]))
+
+        system_instruction = (
+            "You are a professional AI video analyzer. Answer the user's questions about the uploaded video "
+            "based on its content and your analysis. If the question is not about the video, use your general knowledge. "
+            "Be concise, structured, and informative. Always reply in English."
+        )
+
+        with st.spinner("Analyzing video..."):
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.4,
+                )
+            )
+
+        ai_response = response.text
+        if not ai_response or len(ai_response.strip()) < 10:
             return perform_web_search(query)
         return ai_response
     except Exception as e:
         return f"An error occurred: {e}"
 
-
-
 def perform_web_search(query):
-    """Perform web search using Agno's DuckDuckGoTools"""
+    """Perform web search using DuckDuckGo"""
     try:
         with st.spinner("Searching the web..."):
             search = DuckDuckGoSearchRun()
-            # Form search query with better context
             search_prompt = f"Search for information about: {query}"
-            
-            # Run the search via the agent
             response = search.invoke(search_prompt)
-            
-            # Extract and format the response
             if response:
                 return response
             else:
-                return f"No relevant results found for '{query}'. Try asking in a different way."
+                return f"No relevant results found for '{query}'."
     except Exception as e:
         return f"Search error: {e}"
-
-# Initialize the agent
-multimodal_Agent = initialize_agent()
 
 # Check session timeout
 check_session_timeout()
@@ -190,11 +196,12 @@ video_file = st.file_uploader(
 if video_file:
     # Only process if it's a new video or not processed yet
     if (st.session_state.uploaded_video_name != video_file.name or 
-        st.session_state.processed_video_file is None):
+        st.session_state.processed_video_path is None):
         process_video(video_file)
     
     # Display video and chat interface
-    st.video(video_file, format="video/mp4", start_time=0)
+    if st.session_state.processed_video_path:
+        st.video(st.session_state.processed_video_path, format="video/mp4", start_time=0)
     
     # Chat interface
     chat_container = st.container()
